@@ -1,6 +1,6 @@
 use gtk4::prelude::*;
 use gtk4::glib;
-use gtk4::{Application, ApplicationWindow, Box, Button, Image, Label, Orientation, ScrolledWindow, SearchEntry, Separator};
+use gtk4::{Application, ApplicationWindow, Box, Button, Image, Label, Orientation, ScrolledWindow, Popover, Separator};
 use std::collections::HashMap;
 use std::fs;
 
@@ -67,16 +67,31 @@ fn categorize_apps(apps: &[DesktopApp]) -> HashMap<String, Vec<DesktopApp>> {
     let mut categories: HashMap<String, Vec<DesktopApp>> = HashMap::new();
 
     for app in apps {
-        if app.categories.is_empty() {
+        let mut placed = false;
+        for cat in &app.categories {
+            let category = match cat.as_str() {
+                "Utility" => "Utilities",
+                "Development" => "Development",
+                "Graphics" => "Graphics",
+                "Network" => "Internet",
+                "Office" => "Office",
+                "AudioVideo" => "Multimedia",
+                "System" => "System",
+                "Game" => "Games",
+                "Settings" => "Preferences",
+                _ => continue,
+            };
+            categories.entry(category.to_string())
+                .or_insert_with(Vec::new)
+                .push(app.clone());
+            placed = true;
+            break; // Only plce in first matching category
+        }
+
+        if !placed {
             categories.entry("Other".to_string())
                 .or_insert_with(Vec::new)
                 .push(app.clone());
-        } else {
-            for cat in &app.categories {
-                categories.entry(cat.clone())
-                    .or_insert_with(Vec::new)
-                    .push(app.clone());
-            }
         }
     }
 
@@ -97,16 +112,16 @@ fn launch_app(exec: &str) {
     });
 }
 
-fn create_app_button(app: &DesktopApp) -> Button {
+fn create_app_menu_item(app: &DesktopApp) -> Button {
     let button_box = Box::new(Orientation::Horizontal, 8);
-    button_box.set_margin_start(4);
-    button_box.set_margin_end(4);
+    button_box.set_margin_start(8);
+    button_box.set_margin_end(8);
     button_box.set_margin_top(2);
     button_box.set_margin_bottom(2);
 
     if let Some(icon_name) = &app.icon {
         let icon = Image::from_icon_name(icon_name);
-        icon.set_pixel_size(24);
+        icon.set_pixel_size(16);
         button_box.append(&icon);
     }
 
@@ -118,74 +133,62 @@ fn create_app_button(app: &DesktopApp) -> Button {
     let button = Button::new();
     button.set_child(Some(&button_box));
     button.set_has_frame(false);
+    button.add_css_class("menu-item");
 
     let exec = app.exec.clone();
     button.connect_clicked(move |_| {
         launch_app(&exec);
     });
-    
+
     button
 }
 
-fn rebuild_app_list(apps_box: &Box, apps: &[DesktopApp], categories: &HashMap<String, Vec<DesktopApp>>, query: &str) {
-    while let Some(child) = apps_box.first_child() {
-        apps_box.remove(&child);
-    }
+fn create_apps_menu(categories: &HashMap<String, Vec<DesktopApp>>) -> Box {
+    let menu_box = Box::new(Orientation::Vertical, 0);
+    menu_box.set_width_request(250);
 
-    if query.is_empty() {
-        let priority_cats = vec![
-            ("Utilities", "Utility"),
-            ("Development", "Development"),
-            ("Graphics", "Graphics"),
-            ("Internet", "Network"),
-            ("Office", "Office"),
-            ("Multimedia", "AudioVideo"),
-            ("System", "System"),
-        ];
+    let scrolled = ScrolledWindow::new();
+    scrolled.set_policy(gtk4::PolicyType::Never, gtk4::PolicyType::Automatic);
+    scrolled.set_max_content_height(500);
+    scrolled.set_propagate_natural_height(true);
 
-        for (display_name, cat_name) in priority_cats {
-            if let Some(cat_apps) = categories.get(cat_name) {
-                if !cat_apps.is_empty() {
-                    let cat_label = Label::new(Some(display_name));
-                    cat_label.set_halign(gtk4::Align::Start);
-                    cat_label.set_margin_start(12);
-                    cat_label.set_margin_top(12);
-                    cat_label.set_margin_bottom(4);
-                    cat_label.add_css_class("heading");
-                    apps_box.append(&cat_label);
+    let content_box = Box::new(Orientation::Vertical, 0);
 
-                    for app in cat_apps.iter().take(8) {
-                        apps_box.append(&create_app_button(app));
-                    }
+    let priority_cats = vec![
+        "Utilities",
+        "Development",
+        "Graphics",
+        "Internet",
+        "Office",
+        "Multimedia",
+        "System",
+        "Games",
+        "Preferences",
+        "Other",
+    ];
+
+    for cat_name in priority_cats {
+        if let Some(cat_apps) = categories.get(cat_name) {
+            if !cat_apps.is_empty() {
+                let cat_label = Label::new(Some(cat_name));
+                cat_label.set_xalign(0.0);
+                cat_label.set_margin_start(8);
+                cat_label.set_margin_top(8);
+                cat_label.set_margin_bottom(2);
+                cat_label.add_css_class("category-label");
+                content_box.append(&cat_label);
+
+                for app in cat_apps {
+                    content_box.append(&create_app_menu_item(app));
                 }
             }
         }
-    } else {
-        let query_lower = query.to_lowercase();
-        let mut found_apps: Vec<&DesktopApp> = apps.iter()
-            .filter(|app| app.name.to_lowercase().contains(&query_lower))
-            .collect();
-
-        found_apps.sort_by_key(|app| {
-            let name_lower = app.name.to_lowercase();
-            if name_lower.starts_with(&query_lower) {
-                0
-            } else {
-                name_lower.find(&query_lower).unwrap_or(usize::MAX)
-            }
-        });
-
-        if found_apps.is_empty() {
-            let no_results = Label::new(Some("No applications found"));
-            no_results.set_margin_top(20);
-            no_results.add_css_class("dim-label");
-            apps_box.append(&no_results);
-        } else {
-            for app in found_apps.iter().take(20) {
-                apps_box.append(&create_app_button(app));
-            }
-        }
     }
+
+    scrolled.set_child(Some(&content_box));
+    menu_box.append(&scrolled);
+
+    menu_box
 }
 
 fn is_wayland() -> bool {
@@ -202,9 +205,9 @@ fn setup_window_positioning(window: &ApplicationWindow) {
             window.set_layer(Layer::Top);
             window.set_anchor(Edge::Top, true);
             window.set_anchor(Edge::Right, true);
-            window.set_margin(Edge::Top, 8);
-            window.set_margin(Edge::Right, 8);
-            window.set_keyboard_mode(gtk4_layer_shell::KeyboardMode::Exclusive);
+            window.set_margin(Edge::Top, 0);
+            window.set_margin(Edge::Right, 0);
+            window.set_keyboard_mode(gtk4_layer_shell::KeyboardMode::OnDemand);
             return;
         }
     }
@@ -219,121 +222,197 @@ fn setup_window_positioning(window: &ApplicationWindow) {
 fn build_ui(app: &Application) {
     let window = ApplicationWindow::builder()
         .application(app)
-        .title("Deskbar")
-        .default_width(280)
-        .default_height(500)
+        .title("Lacker")
+        .default_width(180)
+        .default_height(600)
         .build();
 
     // Setup positioning based on display server
     setup_window_positioning(&window);
 
     let main_box = Box::new(Orientation::Vertical, 0);
+    main_box.add_css_class("deskbar");
 
-    // Header with clock and date
-    let header_box = Box::new(Orientation::Vertical, 4);
-    header_box.set_margin_top(12);
-    header_box.set_margin_bottom(8);
-    header_box.set_margin_start(12);
-    header_box.set_margin_end(12);
+    // Top section with leaf button
+    let top_box = Box::new(Orientation::Horizontal, 0);
 
+    // Leaf menu
+    let leaf_btn = Button::new();
+    leaf_btn.set_label("🦶");
+    leaf_btn.set_has_frame(false);
+    leaf_btn.add_css_class("leaf-button");
+    leaf_btn.set_hexpand(true);
+
+    // Create apps menu popover
+    let apps = scan_applications();
+    let categories = categorize_apps(&apps);
+    let menu_content = create_apps_menu(&categories);
+
+    let popover = Popover::new();
+    popover.set_child(Some(&menu_content));
+    popover.set_parent(&leaf_btn);
+
+    leaf_btn.connect_clicked(move |btn| {
+        if let Some(popover) = btn.child().and_then(|_| {
+            // Get the popover from the button's parent
+            btn.ancestor(gtk4::Window::static_type())
+                .and_then(|w| w.downcast::<gtk4::Window>().ok())
+                .and_then(|_| Some(popover.clone()))
+        }) {
+            popover.popup();
+        } else {
+            popover.popup();
+        }
+    });
+
+    top_box.append(&leaf_btn);
+    main_box.append(&top_box);
+    main_box.append(&Separator::new(Orientation::Horizontal));
+
+    // System tray area (placeholder)
+    let tray_box = Box::new(Orientation::Horizontal, 4);
+    // let tray_box = Box::new(Orientation::Horizontal, 0);
+    tray_box.set_margin_top(4);
+    tray_box.set_margin_bottom(4);
+
+    // Mock systray icons
+    for icon in ["🔊", "🌐", "🔋"] {
+        let tray_icon_box = Box::new(Orientation::Horizontal, 4);
+        tray_icon_box.set_margin_start(4);
+        tray_icon_box.set_margin_end(4);
+
+        let tray_icon = Button::new();
+        tray_icon.set_label(icon);
+        tray_icon.set_has_frame(false);
+        tray_icon.add_css_class("tray-icon");
+        tray_box.append(&tray_icon);
+
+        tray_box.append(&tray_icon_box);
+    }
+
+    // Clock in tray area
+    let clock_box = Box::new(Orientation::Horizontal, 4);
+    clock_box.set_margin_start(4);
+    clock_box.set_margin_end(4);
+    clock_box.set_margin_top(4);
+
+    let clock_btn = Button::new();
     let time_label = Label::new(Some(&chrono::Local::now().format("%H:%M").to_string()));
-    time_label.set_halign(gtk4::Align::Start);
-    time_label.add_css_class("title-1");
-    header_box.append(&time_label);
-
-    let date_label = Label::new(Some(&chrono::Local::now().format("%A, %B %e").to_string()));
-    date_label.set_halign(gtk4::Align::Start);
-    date_label.add_css_class("dim-label");
-    header_box.append(&date_label);
+    time_label.add_css_class("clock-label");
+    clock_btn.set_child(Some(&time_label));
+    clock_btn.set_has_frame(false);
+    clock_btn.add_css_class("clock-button");
 
     // Update time every minute
     let time_label_clone = time_label.clone();
-    let date_label_clone = date_label.clone();
     glib::timeout_add_seconds_local(60, move || {
-        let now = chrono::Local::now();
-        time_label_clone.set_text(&now.format("%H:%M").to_string());
-        date_label_clone.set_text(&now.format("%A, %B %e").to_string());
+        time_label_clone.set_text(&chrono::Local::now().format("%H:%M").to_string());
         glib::ControlFlow::Continue
     });
 
-    main_box.append(&header_box);
+    clock_box.append(&clock_btn);
+    tray_box.append(&clock_box);
+
+    main_box.append(&tray_box);
     main_box.append(&Separator::new(Orientation::Horizontal));
 
-    // Search
-    let search_entry = SearchEntry::new();
-    search_entry.set_margin_top(12);
-    search_entry.set_margin_start(12);
-    search_entry.set_margin_end(12);
-    search_entry.set_placeholder_text(Some("Search applications..."));
-    main_box.append(&search_entry);
+    // Running applications area
+    let apps_label = Label::new(Some("Running Applications"));
+    apps_label.set_xalign(0.0);
+    apps_label.set_margin_start(8);
+    apps_label.set_margin_top(8);
+    apps_label.set_margin_bottom(4);
+    apps_label.add_css_class("section-label");
+    main_box.append(&apps_label);
 
-    // Apps list
-    let scrolled = ScrolledWindow::new();
-    scrolled.set_vexpand(true);
-    scrolled.set_margin_top(8);
-    scrolled.set_margin_bottom(8);
-    scrolled.set_policy(gtk4::PolicyType::Never, gtk4::PolicyType::Automatic);
+    let running_apps_box = Box::new(Orientation::Vertical, 2);
+    running_apps_box.set_margin_start(4);
+    running_apps_box.set_margin_end(4);
+    running_apps_box.set_vexpand(true);
 
-    let apps_box = Box::new(Orientation::Vertical, 0);
+// Mock running applications
+    for app_name in ["Terminal", "WebPositive", "Tracker"] {
+        let app_btn_box = Box::new(Orientation::Horizontal, 8);
+        app_btn_box.set_margin_start(4);
+        app_btn_box.set_margin_end(4);
+        
+        let icon = Image::from_icon_name("application-x-executable");
+        icon.set_pixel_size(16);
+        app_btn_box.append(&icon);
+        
+        let label = Label::new(Some(app_name));
+        label.set_xalign(0.0);
+        label.set_hexpand(true);
+        app_btn_box.append(&label);
+        
+        let app_btn = Button::new();
+        app_btn.set_child(Some(&app_btn_box));
+        app_btn.set_has_frame(false);
+        app_btn.add_css_class("running-app");
+        
+        running_apps_box.append(&app_btn);
+    }
 
-    let apps = scan_applications();
-    let categories = categorize_apps(&apps);
+    main_box.append(&running_apps_box);
 
-    rebuild_app_list(&apps_box, &apps, &categories, "");
-
-    // Search functionality
-    let apps_box_clone = apps_box.clone();
-    let all_apps = apps.clone();
-    let all_categories = categories.clone();
-    search_entry.connect_search_changed(move |entry| {
-        let query = entry.text().to_string();
-        rebuild_app_list(&apps_box_clone, &all_apps, &all_categories, &query);
-    });
-
-    scrolled.set_child(Some(&apps_box));
-    main_box.append(&scrolled);
-
-    // Footer with system controls
-    main_box.append(&Separator::new(Orientation::Horizontal));
-
-    let footer_box = Box::new(Orientation::Horizontal, 8);
-    footer_box.set_margin_top(8);
-    footer_box.set_margin_bottom(12);
-    footer_box.set_margin_start(12);
-    footer_box.set_margin_end(12);
-    footer_box.set_homogeneous(true);
-
-    let logout_btn = Button::with_label("Log Out");
-    logout_btn.connect_clicked(|_| {
-        let _ = std::process::Command::new("loginctl")
-            .arg("terminate-user")
-            .arg(std::env::var("USER").unwrap_or_default())
-            .spawn();
-    });
-    footer_box.append(&logout_btn);
-
-    let shutdown_btn = Button::with_label("Shutdown");
-    shutdown_btn.connect_clicked(|_| {
-        let _ = std::process::Command::new("systemctl").arg("poweroff").spawn();
-    });
-    footer_box.append(&shutdown_btn);
-
-    main_box.append(&footer_box);
-
-    // Apply custom CSS
     let css_provider = gtk4::CssProvider::new();
     css_provider.load_from_data("
-           window {
-               background-color: @theme_bg_color;
-           }
-           .heading {
-               font-weight: bold;
-               font-size: 0.9em;
-           }
-           button:hover {
-               background-color: alpha(@theme_fg_color, 0.1);
-           }
-        ");
+        .deskbar {
+            background-color: @theme_bg_color;
+            border-bottom: 1px solid alpha(@theme_fg_color, 0.15);
+        }
+        .leaf-button {
+            font-size: 1.3em;
+            padding: 6px 12px;
+            min-width: 40px;
+        }
+        .leaf-button:hover {
+            background-color: alpha(@theme_fg_color, 0.1);
+        }
+        .category-label {
+            font-weight: bold;
+            font-size: 0.85em;
+            color: alpha(@theme_fg_color, 0.7);
+        }
+        .menu-item {
+            padding: 4px 8px;
+            min-height? 28px;
+        }
+        .menu-item:hover {
+            background-color: alpha(@theme_fg_color, 0.8);
+        }
+        .tray-icon {
+            padding: 4px 8px;
+            min-width: 32px;
+            font-size: 1.1em;
+        }
+        .tray-icon:hover {
+            background-color: alpha(@theme_fg_color, 0.1);
+        }
+        .clock-button {
+            padding: 4px 8px;
+            min-width: 60px;
+        }
+        .clock-button:hover {
+            background-color: alpha(@theme_fg_color, 0.1);
+        }
+        .clock-label {
+            font-size: 0.9em;
+            font-family: monospace;
+        }
+        .section-label {
+            font-size: 0.85em;
+            font-weight: bold;
+            color: alpha(@theme_fg_color, 0.7);
+        }
+        .running-app {
+            padding: 4px 8px;
+            min-height: 28px;
+        }
+        .running-app:hover {
+            background-color: alpha(@theme_fg_color, 0.1);
+        }
+    ");
 
     gtk4::style_context_add_provider_for_display(
         &gtk4::gdk::Display::default().unwrap(),
