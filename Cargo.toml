@@ -8,6 +8,9 @@ gtk4 = "0.9"
 gtk4-layer-shell = {version = "0.4", optional = true}
 freedesktop-desktop-entry = "0.5"
 chrono = "0.4"
+zbus = "4.0"
+futures = "0.3"
+tokio = { version = "1", features = ["rt", "macros"] }
 
 [features]
 default = []

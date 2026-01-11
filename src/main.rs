@@ -1,12 +1,63 @@
 use gtk4::prelude::*;
 use gtk4::glib;
-use gtk4::{Application, ApplicationWindow, Box, Button, Image, Label, Orientation, ScrolledWindow, Popover, Separator};
+use gtk4::{Application, ApplicationWindow, Button, Image, Label, Orientation, ScrolledWindow, Popover, Separator};
+use gtk4::Box as GtkBox;
 use std::collections::HashMap;
 use std::fs;
 use std::process::Command;
+use std::sync::{Arc, Mutex};
+use zbus::{Connection, proxy};
 
 #[cfg(feature = "wayland")]
 use gtk4_layer_shell::{Edge, Layer, LayerShell};
+
+#[derive(Clone, Debug)]
+struct TrayItem {
+    id: String,
+    title: String,
+    icon_name: Option<String>,
+    icon_pixmap: Option<Vec<u8>>,
+    menu_path: Option<String>,
+    service: String,
+}
+
+#[proxy(
+    interface = "org.kde.StatusNotifierItem",
+    default_service = "org.kde.StatusNotifierItem",
+    default_path = "/StatusNotifierItem"
+)]
+trait StatusNotifierItem {
+    #[zbus(property)]
+    fn title(&self) -> zbus::Result<String>;
+
+    #[zbus(property)]
+    fn icon_name(&self) -> zbus::Result<String>;
+
+    #[zbus(property)]
+    fn icon_pixmap(&self) -> zbus::Result<Vec<(i32, i32, Vec<u8>)>>;
+
+    #[zbus(property)]
+    fn menu(&self) -> zbus::Result<zbus::zvariant::OwnedObjectPath>;
+
+    fn activate(&self, x: i32, y: i32) -> zbus::Result<()>;
+    fn secondary_activate(&self, x: i32, y: i32) -> zbus::Result<()>;
+}
+
+#[proxy(
+    interface = "org.kde.StatusNotifierWatcher",
+    default_service = "org.kde.StatusNotifierWatcher",
+    default_path = "/StatusNotifierWatcher"
+)]
+trait StatusNotifierWatcher {
+    #[zbus(property)]
+    fn registered_status_notifier_items(&self) -> zbus::Result<Vec<String>>;
+
+    #[zbus(signal)]
+    fn status_notifier_item_registered(&self, service: &str) -> zbus::Result<()>;
+
+    #[zbus(signal)]
+    fn status_notifier_item_unregistered(&self, service: &str) -> zbus::Result<()>;
+}
 
 #[derive(Clone, Debug)]
 struct DesktopApp {
@@ -331,8 +382,114 @@ fn close_app(app: &RunningApp) {
     }
 }
 
+async fn get_tray_items() -> Vec<TrayItem> {
+    let mut items = Vec::new();
+
+    // Connect to session bus
+    let Ok(connection) = Connection::session().await else {
+        eprintln!("Failed to connect to session bus");
+        return items;
+    };
+
+    // Try to get StatusNotifierWatcher
+    let watcher_result = StatusNotifierWatcherProxy::builder(&connection)
+        .destination("org.kde.StatusNotifierWatcher").ok()
+        .and_then(|b| b.path("/StatusNotifierWatcher").ok())
+        .map(|b| b.build());
+
+    if let Some(watcher_future) = watcher_result {
+        match watcher_future.await {
+            Ok(watcher) => {
+                eprintln!("Connected to StatusNotifierWatcher");
+                match watcher.registered_status_notifier_items().await {
+                    Ok(registered_items) => {
+                        eprintln!("Found {} registeder items", registered_items.len());
+                        for item_service in registered_items {
+                            eprintln!("Processing item: {}", item_service);
+                            
+                            // Parse service and path
+                            let (service, path) = if item_service.contains('/') {
+                                let parts: Vec<&str> = item_service.splitn(2, '/').collect();
+                                (parts[0].to_string(), format!("/{}", parts[1]))
+                            } else {
+                                (item_service.clone(), "/StatusNotifierItem".to_string())
+                            };
+
+                            eprintln!("    Service: {}, Path: {}", service, path);
+
+                            // Connect to the item
+                            let service_clone = service.clone();
+                            let path_clone = path.clone();
+                            let item_result = StatusNotifierItemProxy::builder(&connection)
+                                .destination(service_clone.as_str()).ok()
+                                .and_then(|b| b.path(path_clone.as_str()).ok())
+                                .map(|b| b.build());
+
+                            if let Some(item_future) = item_result {
+                                match item_future.await {
+                                    Ok(item_proxy) => {
+                                        let title = item_proxy.title().await.unwrap_or_else(|e| {
+                                            eprintln!("    Failed to get title: {}", e);
+                                            String::new()
+                                        });
+                                        let icon_name = item_proxy.icon_name().await.ok();
+                                        let menu_path = item_proxy.menu().await.ok().map(|p| p.to_string());
+
+                                        eprintln!("    Title: {}, Icon: {:?}", title, icon_name);
+
+                                        items.push(TrayItem {
+                                            id: item_service.clone(),
+                                            title,
+                                            icon_name,
+                                            icon_pixmap: None,
+                                            menu_path,
+                                            service,
+                                        });
+                                    }
+                                    Err(e) => eprintln!("    Failed to connect to item: {}", e),
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => eprintln!("Failed to get registered items: {}", e),
+                }
+            }
+            Err(e) => eprintln!("Failed to connect to StatusNotifierWatcher: {}", e),
+        }
+    } else {
+        eprintln!("Could not create watcher proxy");
+    }
+
+    eprintln!("Total tray items found: {}", items.len());
+    items
+}
+
+fn create_tray_icon_widget(item: &TrayItem) -> Button {
+    let btn = Button::new();
+    btn.set_has_frame(false);
+    btn.add_css_class("tray-icon");
+
+    // Try to use icon name first
+    if let Some(icon_name) = &item.icon_name {
+        if !icon_name.is_empty() {
+            let icon = Image::from_icon_name(icon_name);
+            icon.set_pixel_size(16);
+            btn.set_child(Some(&icon));
+        }
+    }
+
+    // If no icon, show first letter of title
+    if btn.child().is_none() && !item.title.is_empty() {
+        let first_char = item.title.chars().next().unwrap_or('?').to_string();
+        btn.set_label(&first_char);
+    }
+
+    btn.set_tooltip_text(Some(&item.title));
+    btn
+}
+
 fn create_app_menu_item(app: &DesktopApp) -> Button {
-    let button_box = Box::new(Orientation::Horizontal, 8);
+    let button_box = GtkBox::new(Orientation::Horizontal, 8);
 
     if let Some(icon_name) = &app.icon {
         let icon = Image::from_icon_name(icon_name);
@@ -358,8 +515,8 @@ fn create_app_menu_item(app: &DesktopApp) -> Button {
     button
 }
 
-fn create_apps_menu(categories: &HashMap<String, Vec<DesktopApp>>) -> Box {
-    let menu_box = Box::new(Orientation::Vertical, 0);
+fn create_apps_menu(categories: &HashMap<String, Vec<DesktopApp>>) -> GtkBox {
+    let menu_box = GtkBox::new(Orientation::Vertical, 0);
     menu_box.set_width_request(250);
 
     let scrolled = ScrolledWindow::new();
@@ -367,7 +524,7 @@ fn create_apps_menu(categories: &HashMap<String, Vec<DesktopApp>>) -> Box {
     scrolled.set_max_content_height(500);
     scrolled.set_propagate_natural_height(true);
 
-    let content_box = Box::new(Orientation::Vertical, 0);
+    let content_box = GtkBox::new(Orientation::Vertical, 0);
 
     let priority_cats = vec![
         "Utilities",
@@ -441,11 +598,11 @@ fn build_ui(app: &Application) {
     // Setup positioning based on display server
     setup_window_positioning(&window);
 
-    let main_box = Box::new(Orientation::Vertical, 0);
+    let main_box = GtkBox::new(Orientation::Vertical, 0);
     main_box.add_css_class("deskbar");
 
     // Top section with leaf button
-    let top_box = Box::new(Orientation::Horizontal, 0);
+    let top_box = GtkBox::new(Orientation::Horizontal, 0);
 
     // Leaf icon button with popover menu
     let leaf_btn = Button::new();
@@ -471,25 +628,62 @@ fn build_ui(app: &Application) {
     main_box.append(&top_box);
     main_box.append(&Separator::new(Orientation::Horizontal));
 
-    // System tray area (placeholder)
-    let tray_box = Box::new(Orientation::Horizontal, 4);
+    // System tray area
+    let tray_container = GtkBox::new(Orientation::Horizontal, 4);
+    let tray_icons_box = GtkBox::new(Orientation::Horizontal, 4); // Container fro tray icons only (not including clock)
+    let tray_items: Arc<Mutex<Vec<TrayItem>>> = Arc::new(Mutex::new(Vec::new()));
 
-    // Mock systray icons
-    for icon in ["🔊", "🌐", "🔋"] {
-        let tray_icon_box = Box::new(Orientation::Horizontal, 4);
+    // Function to update tray icons
+    let update_tray = {
+        let tray_icons_box = tray_icons_box.clone();
+        let tray_items = tray_items.clone();
+        move || {
+            let tray_icons_box = tray_icons_box.clone();
+            let tray_items = tray_items.clone();
 
-        let tray_icon = Button::new();
-        tray_icon.set_label(icon);
-        tray_icon.set_has_frame(false);
-        tray_icon.add_css_class("tray-icon");
-        tray_icon_box.append(&tray_icon);
+            glib::MainContext::default().spawn_local(async move {
+                let items = get_tray_items().await;
 
-        tray_box.append(&tray_icon_box);
-    }
+                // Update stored items
+                if let Ok(mut stored) = tray_items.lock() {
+                    *stored = items.clone();
+                }
+
+                // Clear existing tray icons
+                while let Some(child) = tray_icons_box.first_child() {
+                    tray_icons_box.remove(&child);
+                }
+
+                // Add new tray icons
+                for item in &items {
+                    let btn = create_tray_icon_widget(item);
+                    tray_icons_box.append(&btn);
+                }
+            });
+        }
+    };
+
+    // Initial update
+    update_tray();
+
+    // Update tray every 5 seconds
+    glib::timeout_add_seconds_local(5, {
+        let update_tray = update_tray.clone();
+        move || {
+            update_tray();
+            glib::ControlFlow::Continue
+        }
+    });
+
+    // Add tray icons box to container
+    tray_container.append(&tray_icons_box);
+
+    // Spacer to push clock to the right
+    let spacer = GtkBox::new(Orientation::Horizontal, 0);
+    spacer.set_hexpand(true);
+    tray_container.append(&spacer);
 
     // Clock in tray area
-    let clock_box = Box::new(Orientation::Horizontal, 4);
-
     let clock_btn = Button::new();
     let time_label = Label::new(Some(&chrono::Local::now().format("%H:%M").to_string()));
     time_label.add_css_class("clock-label");
@@ -504,10 +698,9 @@ fn build_ui(app: &Application) {
         glib::ControlFlow::Continue
     });
 
-    clock_box.append(&clock_btn);
-    tray_box.append(&clock_box);
+    tray_container.append(&clock_btn);
 
-    main_box.append(&tray_box);
+    main_box.append(&tray_container);
     main_box.append(&Separator::new(Orientation::Horizontal));
 
     // Running applications area
@@ -516,7 +709,7 @@ fn build_ui(app: &Application) {
     apps_label.add_css_class("section-label");
     main_box.append(&apps_label);
 
-    let running_apps_box = Box::new(Orientation::Vertical, 2);
+    let running_apps_box = GtkBox::new(Orientation::Vertical, 2);
     running_apps_box.set_vexpand(true);
 
     // Function to update running apps list
@@ -543,7 +736,7 @@ fn build_ui(app: &Application) {
                 running_apps_box.append(&empty_label);
             } else {
                 for app in running_apps {
-                    let app_btn_box = Box::new(Orientation::Horizontal, 8);
+                    let app_btn_box = GtkBox::new(Orientation::Horizontal, 8);
 
                     let icon_name = app.icon.clone().unwrap_or_else(|| "application-x-executable".to_string());
                     let icon = Image::from_icon_name(&icon_name);
@@ -561,12 +754,12 @@ fn build_ui(app: &Application) {
                     app_btn.add_css_class("running-app");
 
                     // Create popover menu for this app
-                    let menu_box = Box::new(Orientation::Vertical, 0);
+                    let menu_box = GtkBox::new(Orientation::Vertical, 0);
                     menu_box.set_width_request(180);
 
                     // Add window items
                     for (idx, window) in app.windows.iter().enumerate() {
-                        let win_btn_box = Box::new(Orientation::Horizontal, 4);
+                        let win_btn_box = GtkBox::new(Orientation::Horizontal, 4);
 
                         let win_label = Label::new(Some(&format!("Window {}", idx + 1)));
                         win_label.set_xalign(0.0);
@@ -593,7 +786,7 @@ fn build_ui(app: &Application) {
                     menu_box.append(&Separator::new(Orientation::Horizontal));
 
                     // Add "Close all" button
-                    let close_btn_box = Box::new(Orientation::Horizontal, 4);
+                    let close_btn_box = GtkBox::new(Orientation::Horizontal, 4);
 
                     let close_label = Label::new(Some("Close all"));
                     close_label.set_xalign(0.0);
@@ -716,5 +909,7 @@ fn main() {
         .build();
 
     app.connect_activate(build_ui);
+
+    // Run with default main context
     app.run();
 }
