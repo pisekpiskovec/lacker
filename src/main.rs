@@ -8,6 +8,9 @@ use std::process::Command;
 use std::sync::{Arc, Mutex};
 use zbus::{Connection, proxy};
 
+mod leaf_menu;
+use leaf_menu::create_leaf_menu;
+
 #[cfg(feature = "wayland")]
 use gtk4_layer_shell::{Edge, Layer, LayerShell};
 
@@ -611,17 +614,11 @@ fn build_ui(app: &Application) {
     leaf_btn.add_css_class("leaf-button");
     leaf_btn.set_hexpand(true);
 
-    // Create apps menu popover
     let apps = scan_applications();
-    let categories = categorize_apps(&apps);
-    let menu_content = create_apps_menu(&categories);
-
-    let popover = Popover::new();
-    popover.set_child(Some(&menu_content));
-    popover.set_parent(&leaf_btn);
+    let leaf_popover = create_leaf_menu(&leaf_btn, &apps);
 
     leaf_btn.connect_clicked(move |_| {
-            popover.popup();
+        leaf_popover.popup();
     });
 
     top_box.append(&leaf_btn);
